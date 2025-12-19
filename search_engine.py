@@ -15,6 +15,9 @@ import time
 import zipfile
 from collections import Counter
 import re
+import os
+from dotenv import load_dotenv
+from supabase import create_client, Client
 
 ARXIV_CATEGORIES = {
     'cs.AI': 'Artificial Intelligence',
@@ -41,6 +44,16 @@ def init_chromadb():
         persist_directory="./chroma_db"
     ))
     return client
+
+load_dotenv()
+
+@st.cache_resource
+def init_supabase():
+    url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY", "")
+    if url and key:
+        return create_client(url, key)
+    return None
 
 def fetch_arxiv_papers(category: str, max_results: int = 20) -> List[Dict]:
     base_url = 'http://export.arxiv.org/api/query?'
@@ -188,6 +201,54 @@ def get_uploaded_pdf(doc_id: str):
         return None
     except Exception as e:
         return None
+    
+def store_uploaded_pdf_supabase(pdf_file, doc_id: str):
+    try:
+        supabase = init_supabase()
+        if not supabase:
+            return False, "Supabase not initialized"
+        
+        pdf_file.seek(0)
+        pdf_bytes = pdf_file.read()
+        
+        file_path = f"{doc_id}.pdf"
+        supabase.storage.from_("pdfs").upload(
+            file_path,
+            pdf_bytes,
+            {"content-type": "application/pdf", "upsert": "true"}
+        )
+        
+        return True, file_path
+    except Exception as e:
+        return False, str(e)
+
+def get_uploaded_pdf_supabase(doc_id: str):
+    try:
+        supabase = init_supabase()
+        if not supabase:
+            return None
+        
+        file_path = f"{doc_id}.pdf"
+        response = supabase.storage.from_("pdfs").download(file_path)
+        return response
+    except Exception as e:
+        return None
+
+def store_arxiv_pdf_supabase(pdf_bytes: bytes, doc_id: str):
+    try:
+        supabase = init_supabase()
+        if not supabase:
+            return False, "Supabase not initialized"
+        
+        file_path = f"{doc_id}.pdf"
+        supabase.storage.from_("pdfs").upload(
+            file_path,
+            pdf_bytes,
+            {"content-type": "application/pdf", "upsert": "true"}
+        )
+        return True, file_path
+    except Exception as e:
+        return True, file_path
 
 def search_similar_documents(collection, model, query_text: str, top_k: int = 5) -> List[Dict]:
     chunks = chunk_text(query_text)
@@ -309,9 +370,11 @@ def initialize_arxiv_corpus(collection, model):
                         }
                         
                         success, message = add_document(collection, model, text, doc_id, metadata)
-                        
+   
                         if success:
                             successful_papers += 1
+                            if pdf_bytes:
+                                store_arxiv_pdf_supabase(pdf_bytes, doc_id)
                 
                 time.sleep(0.5)
                 
@@ -463,11 +526,13 @@ def main():
                                         }
                                         
                                         success, _ = add_document(collection, model, text, doc_id, metadata)
-                                        
+   
                                         if success:
                                             total_indexed += 1
                                             papers_fetched += 1
                                             existing_docs.append(doc_id)
+                                            if pdf_bytes:
+                                                store_arxiv_pdf_supabase(pdf_bytes, doc_id)
                                 
                                 time.sleep(0.5)
                                 
@@ -558,7 +623,7 @@ def main():
                             if text:
                                 doc_id = doc_name.replace(' ', '_').replace('/', '_')
                                 
-                                pdf_stored, pdf_path = store_uploaded_pdf(uploaded_file, doc_id)
+                                pdf_stored, pdf_path = store_uploaded_pdf_supabase(uploaded_file, doc_id)
                                 
                                 metadata = {
                                     "name": doc_name,
@@ -845,7 +910,7 @@ def main():
                                         pass
                                 
                                 elif info.get('type') == 'uploaded':
-                                    pdf_bytes = get_uploaded_pdf(doc_id)
+                                    pdf_bytes = get_uploaded_pdf_supabase(doc_id)
                                     if pdf_bytes:
                                         filename = info.get('filename', f"{doc_id}.pdf")
                                         zip_file.writestr(filename, pdf_bytes)
@@ -906,7 +971,7 @@ def main():
                                     st.button("📥 Download PDF (Error)", disabled=True, key=f"download_{doc_id}")
                             
                             elif info.get('type') == 'uploaded':
-                                pdf_bytes = get_uploaded_pdf(doc_id)
+                                pdf_bytes = get_uploaded_pdf_supabase(doc_id)
                                 if pdf_bytes:
                                     st.download_button(
                                         label="📥 Download PDF",
