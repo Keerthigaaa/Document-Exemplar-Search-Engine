@@ -54,11 +54,11 @@ def init_supabase():
 
 def store_arxiv_pdf_supabase(pdf_bytes: bytes, doc_id: str):
 
-    try:
-        supabase = init_supabase()
-        if not supabase:
-            return False
+    supabase = init_supabase()
+    if not supabase:
+        return False
 
+    try:
         file_path = f"{doc_id}.pdf"
 
         supabase.storage.from_("pdfs").upload(
@@ -72,8 +72,9 @@ def store_arxiv_pdf_supabase(pdf_bytes: bytes, doc_id: str):
         return True
 
     except Exception as e:
-        st.error(f"Error storing PDF in Supabase: {str(e)}")
+        st.warning(f"PDF upload failed for {doc_id}: {str(e)}")
         return False
+
 
 
 def fetch_arxiv_papers(category: str, max_results: int = 20) -> List[Dict]:
