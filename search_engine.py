@@ -251,7 +251,7 @@ def store_embeddings_supabase(model, doc_id: str, text: str, metadata: dict):
 
     try:
         supabase.table("document_chunks").insert(rows).execute()
-        return True, "Embeddings stored in Supabase"
+        return True, "Document added successfully"
     except Exception as e:
         return False, str(e)
 
@@ -1043,7 +1043,7 @@ def main():
                         if not supabase:
                             st.error("Supabase not initialized")
                         else:
-                            supabase.table("document_chunks").delete().neq("doc_id", "").execute()
+                            supabase.rpc("clear_document_chunks").execute()
                             st.success("✅ Repository cleared successfully!")
                             time.sleep(1)
                             st.rerun()
