@@ -46,11 +46,24 @@ load_dotenv()
 
 @st.cache_resource
 def init_supabase():
-    url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY", "")
-    if url and key:
+
+    url = st.secrets.get("SUPABASE_URL", None)
+    key = st.secrets.get("SUPABASE_KEY", None)
+    
+    if not url or not key:
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+
+    if not url or not key:
+        st.error("❌ Supabase credentials not found. Check Streamlit secrets.")
+        return None
+
+    try:
         return create_client(url, key)
-    return None
+    except Exception as e:
+        st.error(f"❌ Failed to initialize Supabase client: {str(e)}")
+        return None
+
 
 def store_arxiv_pdf_supabase(pdf_bytes: bytes, doc_id: str):
 
