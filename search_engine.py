@@ -402,6 +402,7 @@ def initialize_arxiv_corpus(_collection, model):
                 time.sleep(0.5)
                 
             except Exception as e:
+                st.warning(f"Failed to process paper {paper['id']}: {str(e)}")
                 continue
             
         
