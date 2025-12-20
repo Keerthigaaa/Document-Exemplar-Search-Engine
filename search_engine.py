@@ -1,11 +1,8 @@
 import streamlit as st
-import chromadb
-from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 import PyPDF2
 import io
 import tempfile
-import os
 from typing import List, Dict, Tuple
 import numpy as np
 import requests
@@ -36,14 +33,14 @@ ARXIV_CATEGORIES = {
 def load_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
 
-@st.cache_resource
-def init_chromadb():
-    client = chromadb.Client(Settings(
-        anonymized_telemetry=False,
-        is_persistent=True,
-        persist_directory="./chroma_db"
-    ))
-    return client
+# @st.cache_resource
+# def init_chromadb():
+#     client = chromadb.Client(Settings(
+#         anonymized_telemetry=False,
+#         is_persistent=True,
+#         persist_directory="./chroma_db"
+#     ))
+#     return client
 
 load_dotenv()
 
@@ -54,6 +51,30 @@ def init_supabase():
     if url and key:
         return create_client(url, key)
     return None
+
+def store_arxiv_pdf_supabase(pdf_bytes: bytes, doc_id: str):
+
+    try:
+        supabase = init_supabase()
+        if not supabase:
+            return False
+
+        file_path = f"{doc_id}.pdf"
+
+        supabase.storage.from_("pdfs").upload(
+            file_path,
+            pdf_bytes,
+            {
+                "content-type": "application/pdf",
+                "upsert": "true"
+            }
+        )
+        return True
+
+    except Exception as e:
+        st.error(f"Error storing PDF in Supabase: {str(e)}")
+        return False
+
 
 def fetch_arxiv_papers(category: str, max_results: int = 20) -> List[Dict]:
     base_url = 'http://export.arxiv.org/api/query?'
@@ -131,12 +152,6 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[st
     
     return chunks
 
-def extract_keywords(text: str, top_n: int = 5) -> List[str]:
-    words = re.findall(r'\b[a-z]{4,}\b', text.lower())
-    stop_words = {'this', 'that', 'with', 'from', 'have', 'been', 'were', 'their', 'which', 'these', 'such', 'other', 'than', 'into', 'through', 'about', 'after', 'before', 'could', 'would', 'should'}
-    filtered_words = [w for w in words if w not in stop_words]
-    word_freq = Counter(filtered_words)
-    return [word for word, _ in word_freq.most_common(top_n)]
 
 def generate_summary_from_abstract(abstract: str) -> str:
     
@@ -155,52 +170,15 @@ def generate_summary_from_abstract(abstract: str) -> str:
     return summary
 
 
-def add_document(collection, model, doc_text: str, doc_id: str, metadata: Dict):
-    chunks = chunk_text(doc_text)
-    
-    if not chunks:
-        return False, "No text found in document"
-    
-    embeddings = model.encode(chunks).tolist()
-    
-    ids = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
-    metadatas = [{**metadata, "chunk_id": i, "doc_id": doc_id} for i in range(len(chunks))]
-    
-    try:
-        collection.add(
-            embeddings=embeddings,
-            documents=chunks,
-            ids=ids,
-            metadatas=metadatas
-        )
-        return True, f"Successfully added document"
-    except Exception as e:
-        return False, f"Error adding document: {str(e)}"
+def add_document(_collection, model, doc_text: str, doc_id: str, metadata: Dict):
+    success, message = store_embeddings_supabase(
+        model=model,
+        doc_id=doc_id,
+        text=doc_text,
+        metadata=metadata
+    )
+    return success, message
 
-def store_uploaded_pdf(pdf_file, doc_id: str):
-    try:
-        os.makedirs("./uploaded_pdfs", exist_ok=True)
-        
-        pdf_path = f"./uploaded_pdfs/{doc_id}.pdf"
-        
-        pdf_file.seek(0)
-        
-        with open(pdf_path, 'wb') as f:
-            f.write(pdf_file.read())
-        
-        return True, pdf_path
-    except Exception as e:
-        return False, str(e)
-
-def get_uploaded_pdf(doc_id: str):
-    try:
-        pdf_path = f"./uploaded_pdfs/{doc_id}.pdf"
-        if os.path.exists(pdf_path):
-            with open(pdf_path, 'rb') as f:
-                return f.read()
-        return None
-    except Exception as e:
-        return None
     
 def store_uploaded_pdf_supabase(pdf_file, doc_id: str):
     try:
@@ -234,103 +212,147 @@ def get_uploaded_pdf_supabase(doc_id: str):
     except Exception as e:
         return None
 
-def store_arxiv_pdf_supabase(pdf_bytes: bytes, doc_id: str):
-    try:
-        supabase = init_supabase()
-        if not supabase:
-            return False, "Supabase not initialized"
-        
-        file_path = f"{doc_id}.pdf"
-        supabase.storage.from_("pdfs").upload(
-            file_path,
-            pdf_bytes,
-            {"content-type": "application/pdf", "upsert": "true"}
-        )
-        return True, file_path
-    except Exception as e:
-        return True, file_path
+def store_embeddings_supabase(model, doc_id: str, text: str, metadata: dict):
 
-def search_similar_documents(collection, model, query_text: str, top_k: int = 5) -> List[Dict]:
-    chunks = chunk_text(query_text)
-    
+    supabase = init_supabase()
+    if not supabase:
+        return False, "Supabase not initialized"
+
+    chunks = chunk_text(text)
+
     if not chunks:
-        return []
-    
-    query_embeddings = model.encode(chunks)
-    avg_embedding = np.mean(query_embeddings, axis=0).tolist()
-    
+        return False, "No text chunks found"
+
+    embeddings = model.encode(chunks).tolist()
+
+    rows = []
+    for i, chunk in enumerate(chunks):
+        rows.append({
+            "doc_id": doc_id,
+            "chunk_index": i,
+            "content": chunk,
+            "metadata": metadata,
+            "embedding": embeddings[i]
+        })
+
     try:
-        results = collection.query(
-            query_embeddings=[avg_embedding],
-            n_results=top_k * 5
-        )
-        
+        supabase.table("document_chunks").insert(rows).execute()
+        return True, "Embeddings stored in Supabase"
+    except Exception as e:
+        return False, str(e)
+
+def search_embeddings_supabase(model, query_text: str, top_k: int = 5):
+
+    supabase = init_supabase()
+    if not supabase:
+        return []
+
+    query_embedding = model.encode([query_text])[0].tolist()
+
+    try:
+        response = supabase.rpc(
+            "match_document_chunks",
+            {
+                "query_embedding": query_embedding,
+                "match_count": top_k * 5
+            }
+        ).execute()
+
+        rows = response.data if response.data else []
+
         doc_scores = {}
         doc_metadata = {}
-        
-        if results['metadatas'] and len(results['metadatas']) > 0:
-            for i, metadata in enumerate(results['metadatas'][0]):
-                doc_id = metadata.get('doc_id', 'unknown')
-                distance = results['distances'][0][i]
-                similarity = 1 / (1 + distance)
-                
-                if doc_id not in doc_scores:
-                    doc_scores[doc_id] = []
-                    doc_metadata[doc_id] = metadata
-                
-                doc_scores[doc_id].append(similarity)
-        
-        doc_rankings = []
+
+        for row in rows:
+            doc_id = row["doc_id"]
+            similarity = 1 - row["distance"]
+
+            if doc_id not in doc_scores:
+                doc_scores[doc_id] = []
+                doc_metadata[doc_id] = row.get("metadata", {})
+
+            doc_scores[doc_id].append(similarity)
+
+        results = []
         for doc_id, scores in doc_scores.items():
-            avg_score = np.mean(scores)
-            doc_rankings.append({
-                'doc_id': doc_id,
-                'similarity': avg_score,
-                'metadata': doc_metadata[doc_id]
+            results.append({
+                "doc_id": doc_id,
+                "similarity": sum(scores) / len(scores),
+                "metadata": doc_metadata[doc_id]
             })
-        
-        doc_rankings.sort(key=lambda x: x['similarity'], reverse=True)
-        
-        return doc_rankings[:top_k]
-    
+
+        results.sort(key=lambda x: x["similarity"], reverse=True)
+        return results[:top_k]
+
     except Exception as e:
-        st.error(f"Error searching: {str(e)}")
+        st.error(f"Vector search error: {str(e)}")
         return []
 
-def delete_document(collection, doc_id: str):
+
+def search_similar_documents(_collection, model, query_text: str, top_k: int = 5) -> List[Dict]:
+    return search_embeddings_supabase(
+        model=model,
+        query_text=query_text,
+        top_k=top_k
+    )
+
+def delete_document_supabase(doc_id: str):
+
+    supabase = init_supabase()
+    if not supabase:
+        return False, "Supabase not initialized"
+
     try:
-        results = collection.get(where={"doc_id": doc_id})
-        
-        if results['ids']:
-            collection.delete(ids=results['ids'])
-            return True, f"Deleted document successfully"
-        else:
-            return False, f"Document {doc_id} not found"
+        supabase.table("document_chunks") \
+            .delete() \
+            .eq("doc_id", doc_id) \
+            .execute()
+
+        return True, "Deleted document successfully"
+
     except Exception as e:
         return False, f"Error deleting document: {str(e)}"
 
-def list_documents(collection):
+
+def list_documents_supabase():
+
+    supabase = init_supabase()
+    if not supabase:
+        return [], {}
+
     try:
-        results = collection.get()
+        response = supabase.table("document_chunks") \
+            .select("doc_id, metadata") \
+            .execute()
+
+        rows = response.data if response.data else []
+
         doc_ids = set()
         doc_info = {}
-        
-        if results['metadatas']:
-            for metadata in results['metadatas']:
-                doc_id = metadata.get('doc_id', 'unknown')
+
+        for row in rows:
+            doc_id = row.get("doc_id")
+            metadata = row.get("metadata", {})
+
+            if doc_id:
                 doc_ids.add(doc_id)
                 if doc_id not in doc_info:
                     doc_info[doc_id] = metadata
-        
+
         return list(doc_ids), doc_info
+
     except Exception as e:
-        st.error(f"Error listing documents: {str(e)}")
+        st.error(f"Error listing documents from Supabase: {str(e)}")
         return [], {}
 
-def initialize_arxiv_corpus(collection, model):
-    doc_ids, _ = list_documents(collection)
+
+def initialize_arxiv_corpus(_collection, model):
+    doc_ids, _ = list_documents_supabase()
+
     if len(doc_ids) > 0:
-        return False, f"Corpus already initialized with {len(doc_ids)} documents"
+        st.info(f"Corpus already initialized with {len(doc_ids)} documents")
+        return True, f"Corpus already initialized with {len(doc_ids)} documents"
+
     
     st.info("🔄 Initializing corpus with arXiv papers. This will take several minutes...")
     progress_bar = st.progress(0)
@@ -369,7 +391,7 @@ def initialize_arxiv_corpus(collection, model):
                             'abstract': paper['summary']
                         }
                         
-                        success, message = add_document(collection, model, text, doc_id, metadata)
+                        success, message = add_document(None, model, text, doc_id, metadata)
    
                         if success:
                             successful_papers += 1
@@ -381,13 +403,13 @@ def initialize_arxiv_corpus(collection, model):
             except Exception as e:
                 st.warning(f"Failed to process paper {paper['id']}: {str(e)}")
                 continue
+            
         
         progress = (idx + 1) / total_categories
         progress_bar.progress(progress)
         status_text.text(f"Processed {category_name}: {successful_papers}/{total_papers} papers indexed")
     
     progress_bar.progress(1.0)
-    
     return True, f"Successfully initialized corpus with {successful_papers} papers from {total_categories} domains"
 
 def main():
@@ -401,17 +423,6 @@ def main():
     st.divider()
     
     model = load_model()
-    client = init_chromadb()
-    
-    collection_name = "documents"
-    try:
-        collection = client.get_or_create_collection(
-            name=collection_name,
-            metadata={"description": "Document embeddings collection"}
-        )
-    except Exception as e:
-        st.error(f"Error initializing collection: {str(e)}")
-        return
     
     st.sidebar.title("Navigation")
     
@@ -428,13 +439,14 @@ def main():
     if page == "Corpus Status":
         st.header("Corpus Status")
         
-        doc_ids, doc_info = list_documents(collection)
+        doc_ids, doc_info = list_documents_supabase()
+
         
         if len(doc_ids) == 0:
             st.warning("⚠️ Corpus is empty. Initialize with arXiv papers to get started.")
             
             if st.button("Initialize Corpus with arXiv Papers", type="primary"):
-                success, message = initialize_arxiv_corpus(collection, model)
+                success, message = initialize_arxiv_corpus(None, model)
                 if success:
                     st.success(message)
                     st.rerun()
@@ -490,7 +502,8 @@ def main():
                         category_name = ARXIV_CATEGORIES[category]
                         status_text.text(f"Fetching papers from {category_name}...")
                         
-                        existing_docs, _ = list_documents(collection)
+                        existing_docs, _ = list_documents_supabase()
+
                         
                         papers_fetched = 0
                         papers_to_fetch_actual = papers_to_fetch
@@ -525,7 +538,7 @@ def main():
                                             'abstract': paper.get('summary', '')
                                         }
                                         
-                                        success, _ = add_document(collection, model, text, doc_id, metadata)
+                                        success, _ = add_document(None, model, text, doc_id, metadata)
    
                                         if success:
                                             total_indexed += 1
@@ -594,7 +607,8 @@ def main():
                         key=f"source_{uploaded_file.name}"
                     )
                     
-                    _, doc_info = list_documents(collection)
+                    _, doc_info = list_documents_supabase()
+
                     existing_categories = set([info.get('category_name', '') for info in doc_info.values() if info.get('category_name')])
                     existing_categories = sorted(list(existing_categories))
                     
@@ -634,7 +648,7 @@ def main():
                                     "pdf_stored": pdf_stored
                                 }
                                 
-                                success, message = add_document(collection, model, text, doc_id, metadata)
+                                success, message = add_document(None, model, text, doc_id, metadata)
                                 
                                 if success:
                                     st.success(message)
@@ -647,7 +661,8 @@ def main():
     elif page == "Search Documents":
         st.header("🔍 Search for Similar Documents")
         
-        doc_ids, _ = list_documents(collection)
+        doc_ids, _ = list_documents_supabase()
+
         
         if len(doc_ids) == 0:
             st.warning("⚠️ No documents in repository. Please initialize the corpus first.")
@@ -667,7 +682,7 @@ def main():
                         query_text = extract_text_from_pdf(query_file)
                         
                         if query_text:
-                            results = search_similar_documents(collection, model, query_text, top_k=100)
+                            results = search_similar_documents(None, model, query_text, top_k=100)
                             st.session_state.search_results = results
                             st.session_state.query_text = query_text
                         else:
@@ -694,7 +709,8 @@ def main():
                 col1, col2, col3 = st.columns([2, 2, 2])
                 
                 with col2:
-                    _, doc_info = list_documents(collection)
+                    _, doc_info = list_documents_supabase()
+
                     categories = set([info.get('category_name', 'Other') for info in doc_info.values()])
                     categories_list = ['All Categories'] + sorted(list(categories))
                     selected_category = st.selectbox("Select category", categories_list)
@@ -749,19 +765,10 @@ def main():
                         metadata = result['metadata']
                         doc_id = result['doc_id']
                         
-                        try:
-                            doc_data = collection.get(ids=[f"{doc_id}_chunk_0"])
-                            if doc_data and doc_data['documents']:
-                                doc_text = doc_data['documents'][0]
-                                keywords = extract_keywords(doc_text, top_n=5)
-                                abstract = metadata.get('abstract', '')
-                                summary = generate_summary_from_abstract(abstract)
-                            else:
-                                keywords = []
-                                summary = "No summary available."
-                        except:
-                            keywords = []
-                            summary = "No summary available."
+                        keywords = []
+                        abstract = metadata.get("abstract", "")
+                        summary = generate_summary_from_abstract(abstract)
+
                         
                         card_html = f"""
                         <div style='background-color: #33363D; padding: 10px; border-radius: 10px; margin-bottom: 15px; position: relative;'>
@@ -837,7 +844,7 @@ def main():
     elif page == "Manage Repository":
         st.header("🗂️ Manage Document Repository")
         
-        doc_ids, doc_info = list_documents(collection)
+        doc_ids, doc_info = list_documents_supabase()
         
         if doc_ids:
             st.subheader(f"Repository contains {len(doc_ids)} documents")
@@ -995,7 +1002,7 @@ def main():
                         
                         with action_col3:
                             if st.button("🗑️ Delete", key=f"del_{doc_id}", type="secondary"):
-                                success, message = delete_document(collection, doc_id)
+                                success, message = delete_document_supabase(doc_id)
                                 if success:
                                     st.success(message)
                                     time.sleep(1)
@@ -1018,16 +1025,17 @@ def main():
                         disabled=not confirm_clear):
                 if confirm_clear:
                     try:
-                        client.delete_collection(collection_name)
-                        client.get_or_create_collection(
-                            name=collection_name,
-                            metadata={"description": "Document embeddings collection"}
-                        )
-                        st.success("✅ Repository cleared successfully!")
-                        time.sleep(1)
-                        st.rerun()
+                        supabase = init_supabase()
+                        if not supabase:
+                            st.error("Supabase not initialized")
+                        else:
+                            supabase.table("document_chunks").delete().neq("doc_id", "").execute()
+                            st.success("✅ Repository cleared successfully!")
+                            time.sleep(1)
+                            st.rerun()
                     except Exception as e:
                         st.error(f"Error clearing repository: {str(e)}")
+
         
         else:
             st.info("📭 No documents in repository. Please initialize the corpus from the 'Corpus Status' page to get started.")
